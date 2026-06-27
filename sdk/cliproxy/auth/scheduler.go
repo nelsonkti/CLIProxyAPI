@@ -52,6 +52,8 @@ type scheduledAuthMeta struct {
 	auth              *Auth
 	providerKey       string
 	priority          int
+	weight            int // manual weight from Attributes, clamped [1, 100], default 1
+	effectiveWeight   int // auto-adjusted weight; equals weight when auto-weight is off
 	websocketEnabled  bool
 	supportedModelSet map[string]struct{}
 }
@@ -71,6 +73,15 @@ type scheduledAuth struct {
 	auth        *Auth
 	state       scheduledState
 	nextRetryAt time.Time
+	ws          weightState // auto-weight tracking
+}
+
+// weightState tracks the health-based weight adjustment for an auth.
+type weightState struct {
+	baseWeight       int       // manual weight from Attributes
+	effectiveWeight  int       // current adjusted weight (>= 1)
+	consecutiveFails int       // consecutive failure count for decay trigger
+	lastAdjustedAt   time.Time // when weight was last adjusted
 }
 
 // readyBucket keeps the ready views for one priority level.
@@ -81,8 +92,10 @@ type readyBucket struct {
 
 // readyView holds the selection order for flat round-robin traversal.
 type readyView struct {
-	flat   []*scheduledAuth
-	cursor int
+	flat    []*scheduledAuth
+	weights []int // parallel to flat: effectiveWeight per entry
+	cursor  int
+	totalW  int // sum(weights); equals len(flat) when all weights are 1
 }
 
 // cooldownQueue is the blocked auth collection ordered by next retry time during rebuilds.
@@ -106,7 +119,12 @@ func restoreReadyViewCursors(view *readyView, state readyViewCursorState) {
 		return
 	}
 	if len(view.flat) > 0 {
-		view.cursor = normalizeCursor(state.cursor, len(view.flat))
+		// When weights are active, normalize against totalW; otherwise against len(flat).
+		mod := len(view.flat)
+		if view.totalW > 0 && view.totalW != mod {
+			mod = view.totalW
+		}
+		view.cursor = normalizeCursor(state.cursor, mod)
 	}
 }
 
@@ -360,7 +378,7 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 	for providerIndex, shard := range candidateShards {
 		segmentStarts[providerIndex] = totalWeight
 		if shard != nil {
-			weights[providerIndex] = shard.readyCountAtPriorityLocked(false, bestPriority)
+			weights[providerIndex] = shard.readyWeightSumAtPriorityLocked(false, bestPriority)
 		}
 		totalWeight += weights[providerIndex]
 		segmentEnds[providerIndex] = totalWeight
@@ -539,10 +557,13 @@ func (s *authScheduler) ensureProviderLocked(providerKey string) *providerSchedu
 // buildScheduledAuthMeta extracts the scheduling metadata needed for shard bookkeeping.
 func buildScheduledAuthMeta(auth *Auth) *scheduledAuthMeta {
 	providerKey := executorKeyFromAuth(auth)
+	w := authWeight(auth)
 	return &scheduledAuthMeta{
 		auth:              auth,
 		providerKey:       providerKey,
 		priority:          authPriority(auth),
+		weight:            w,
+		effectiveWeight:   w,
 		websocketEnabled:  authWebsocketsEnabled(auth),
 		supportedModelSet: supportedModelSetForAuth(auth.ID),
 	}
@@ -648,16 +669,30 @@ func (m *modelScheduler) upsertEntryLocked(meta *scheduledAuthMeta, now time.Tim
 	}
 	entry, ok := m.entries[meta.auth.ID]
 	if !ok || entry == nil {
-		entry = &scheduledAuth{}
+		entry = &scheduledAuth{
+			ws: weightState{
+				baseWeight:      meta.weight,
+				effectiveWeight: meta.effectiveWeight,
+			},
+		}
 		m.entries[meta.auth.ID] = entry
 	}
 	previousState := entry.state
 	previousNextRetryAt := entry.nextRetryAt
 	previousPriority := 0
 	previousWebsocketEnabled := false
+	previousWeight := 1
 	if entry.meta != nil {
 		previousPriority = entry.meta.priority
 		previousWebsocketEnabled = entry.meta.websocketEnabled
+		previousWeight = entry.meta.weight
+	}
+
+	// If manual weight changed, reset auto-weight state.
+	if previousWeight != meta.weight {
+		entry.ws.baseWeight = meta.weight
+		entry.ws.effectiveWeight = meta.weight
+		entry.ws.consecutiveFails = 0
 	}
 
 	entry.meta = meta
@@ -677,7 +712,7 @@ func (m *modelScheduler) upsertEntryLocked(meta *scheduledAuthMeta, now time.Tim
 		entry.nextRetryAt = next
 	}
 
-	if ok && previousState == entry.state && previousNextRetryAt.Equal(entry.nextRetryAt) && previousPriority == meta.priority && previousWebsocketEnabled == meta.websocketEnabled {
+	if ok && previousState == entry.state && previousNextRetryAt.Equal(entry.nextRetryAt) && previousPriority == meta.priority && previousWebsocketEnabled == meta.websocketEnabled && previousWeight == meta.weight {
 		return
 	}
 	m.rebuildIndexesLocked()
@@ -941,7 +976,18 @@ func buildReadyBucket(entries []*scheduledAuth) *readyBucket {
 
 // buildReadyView creates a flat view for rotation.
 func buildReadyView(entries []*scheduledAuth) readyView {
-	return readyView{flat: append([]*scheduledAuth(nil), entries...)}
+	flat := append([]*scheduledAuth(nil), entries...)
+	weights := make([]int, len(flat))
+	totalW := 0
+	for i, e := range flat {
+		w := 1
+		if e != nil && e.meta != nil && e.meta.effectiveWeight > 0 {
+			w = e.meta.effectiveWeight
+		}
+		weights[i] = w
+		totalW += w
+	}
+	return readyView{flat: flat, weights: weights, cursor: 0, totalW: totalW}
 }
 
 // pickFirst returns the first ready entry that satisfies predicate without advancing cursors.
@@ -954,23 +1000,182 @@ func (v *readyView) pickFirst(predicate func(*scheduledAuth) bool) *scheduledAut
 	return nil
 }
 
-// pickRoundRobin returns the next ready entry using flat round-robin traversal.
+// pickRoundRobin returns the next ready entry using weighted round-robin traversal.
+// When all weights are 1, this is identical to uniform modulo round-robin (fast path).
+// Higher weights get proportionally more picks within the same priority tier.
 func (v *readyView) pickRoundRobin(predicate func(*scheduledAuth) bool) *scheduledAuth {
 	if len(v.flat) == 0 {
 		return nil
 	}
-	start := 0
-	if len(v.flat) > 0 {
-		start = v.cursor % len(v.flat)
+
+	// Fast path: uniform weights → classic modulo round-robin (zero overhead).
+	if v.totalW <= 0 || v.totalW == len(v.flat) {
+		start := 0
+		if len(v.flat) > 0 {
+			start = v.cursor % len(v.flat)
+		}
+		for offset := 0; offset < len(v.flat); offset++ {
+			index := (start + offset) % len(v.flat)
+			entry := v.flat[index]
+			if predicate != nil && !predicate(entry) {
+				continue
+			}
+			v.cursor = index + 1
+			return entry
+		}
+		return nil
 	}
-	for offset := 0; offset < len(v.flat); offset++ {
-		index := (start + offset) % len(v.flat)
-		entry := v.flat[index]
+
+	// Weighted path: cursor operates in [0, totalW) slot space.
+	startSlot := v.cursor % v.totalW
+	for offset := 0; offset < v.totalW; offset++ {
+		slot := (startSlot + offset) % v.totalW
+		idx := v.slotToIndex(slot)
+		if idx < 0 {
+			continue
+		}
+		entry := v.flat[idx]
 		if predicate != nil && !predicate(entry) {
 			continue
 		}
-		v.cursor = index + 1
+		v.cursor = slot + 1
 		return entry
 	}
 	return nil
+}
+
+// slotToIndex maps a slot position in [0, totalW) to a flat array index
+// using cumulative weight segments.
+func (v *readyView) slotToIndex(slot int) int {
+	cumulative := 0
+	for i, w := range v.weights {
+		cumulative += w
+		if slot < cumulative {
+			return i
+		}
+	}
+	return -1
+}
+
+// Weight auto-adjustment constants.
+const (
+	weightDecayFactor     = 0.5 // multiply effectiveWeight on decay
+	weightRecoveryRate    = 1   // add per success toward baseWeight
+	weightMinEffective    = 1   // never go below 1
+	weightAdjustThreshold = 3   // consecutive fails before first decay
+)
+
+// adjustWeight updates the effective weight of an auth based on a success/failure signal.
+// On consecutive failures (>= threshold), effectiveWeight is halved (floor 1).
+// On success, effectiveWeight increments by 1 toward baseWeight.
+// When autoWeight is disabled (effectiveWeight always == weight), this is a no-op.
+func (s *authScheduler) adjustWeight(authID, model string, success bool) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	providerKey := s.authProviders[authID]
+	if providerKey == "" {
+		return
+	}
+	providerState := s.providers[providerKey]
+	if providerState == nil {
+		return
+	}
+	modelKey := canonicalModelKey(model)
+	shard := providerState.modelShards[modelKey]
+	if shard == nil {
+		return
+	}
+	entry, ok := shard.entries[authID]
+	if !ok || entry == nil || entry.meta == nil {
+		return
+	}
+
+	ws := &entry.ws
+	if success {
+		if ws.consecutiveFails > 0 {
+			ws.consecutiveFails = 0
+		}
+		if ws.effectiveWeight < ws.baseWeight {
+			ws.effectiveWeight = min(ws.baseWeight, ws.effectiveWeight+weightRecoveryRate)
+			entry.meta.effectiveWeight = ws.effectiveWeight
+			ws.lastAdjustedAt = time.Now()
+			shard.rebuildIndexesLocked()
+		}
+	} else {
+		ws.consecutiveFails++
+		if ws.consecutiveFails >= weightAdjustThreshold && ws.effectiveWeight > weightMinEffective {
+			decayed := int(float64(ws.effectiveWeight) * weightDecayFactor)
+			if decayed < weightMinEffective {
+				decayed = weightMinEffective
+			}
+			if decayed != ws.effectiveWeight {
+				ws.effectiveWeight = decayed
+				entry.meta.effectiveWeight = decayed
+				ws.lastAdjustedAt = time.Now()
+				shard.rebuildIndexesLocked()
+			}
+		}
+	}
+}
+
+// WeightInfo holds the weight state of an auth for the management API.
+type WeightInfo struct {
+	BaseWeight       int
+	EffectiveWeight  int
+	ConsecutiveFails int
+}
+
+// effectiveWeightInfo returns the weight state for an auth.
+// Since weight state is tracked per (auth, model) shard, it returns the first
+// match found — in practice the weight state is consistent across shards for
+// the same auth because decay/recovery signals come from the same auth's traffic.
+func (s *authScheduler) effectiveWeightInfo(authID string) *WeightInfo {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	providerKey := s.authProviders[authID]
+	if providerKey == "" {
+		return nil
+	}
+	providerState := s.providers[providerKey]
+	if providerState == nil {
+		return nil
+	}
+	for _, shard := range providerState.modelShards {
+		if shard == nil {
+			continue
+		}
+		entry, ok := shard.entries[authID]
+		if !ok || entry == nil {
+			continue
+		}
+		return &WeightInfo{
+			BaseWeight:       entry.ws.baseWeight,
+			EffectiveWeight:  entry.ws.effectiveWeight,
+			ConsecutiveFails: entry.ws.consecutiveFails,
+		}
+	}
+	return nil
+}
+
+// readyWeightSumAtPriorityLocked returns the total effective weight sum for ready auths
+// at the given priority level. Used by mixed-provider weighted selection.
+func (m *modelScheduler) readyWeightSumAtPriorityLocked(preferWebsocket bool, priority int) int {
+	if m == nil {
+		return 0
+	}
+	bucket := m.readyByPriority[priority]
+	if bucket == nil {
+		return 0
+	}
+	view := &bucket.all
+	if preferWebsocket && len(bucket.ws.flat) > 0 {
+		view = &bucket.ws
+	}
+	return view.totalW
 }

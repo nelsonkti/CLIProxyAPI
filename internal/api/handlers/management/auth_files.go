@@ -427,6 +427,16 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
 						}
 					}
 				}
+				if wv := gjson.GetBytes(data, "weight"); wv.Exists() {
+					switch wv.Type {
+					case gjson.Number:
+						fileData["weight"] = int(wv.Int())
+					case gjson.String:
+						if parsed, errAtoi := strconv.Atoi(strings.TrimSpace(wv.String())); errAtoi == nil {
+							fileData["weight"] = parsed
+						}
+					}
+				}
 				if nv := gjson.GetBytes(data, "note"); nv.Exists() && nv.Type == gjson.String {
 					if trimmed := strings.TrimSpace(nv.String()); trimmed != "" {
 						fileData["note"] = trimmed
@@ -550,6 +560,45 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 				if parsed, err := strconv.Atoi(strings.TrimSpace(v)); err == nil {
 					entry["priority"] = parsed
 				}
+			}
+		}
+	}
+	// Expose weight from Attributes (set by synthesizer from JSON "weight" field).
+	// Fall back to Metadata for auths registered via UploadAuthFile (no synthesizer).
+	// Default weight is 0 (not set, treated as 1 for uniform distribution by scheduler).
+	weight := 0
+	if w := strings.TrimSpace(authAttribute(auth, "weight")); w != "" {
+		if parsed, err := strconv.Atoi(w); err == nil && parsed >= 1 {
+			weight = parsed
+		}
+	} else if auth.Metadata != nil {
+		if rawWeight, ok := auth.Metadata["weight"]; ok {
+			switch v := rawWeight.(type) {
+			case float64:
+				if int(v) >= 1 {
+					weight = int(v)
+				}
+			case int:
+				if v >= 1 {
+					weight = v
+				}
+			case string:
+				if parsed, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && parsed >= 1 {
+					weight = parsed
+				}
+			}
+		}
+	}
+	if weight > 100 {
+		weight = 100
+	}
+	entry["weight"] = weight
+	// Expose effective_weight from scheduler (auto-adjusted weight, may differ from base weight).
+	if h.authManager != nil {
+		if wInfo := h.authManager.EffectiveWeightInfo(auth.ID); wInfo != nil {
+			entry["effective_weight"] = wInfo.EffectiveWeight
+			if wInfo.ConsecutiveFails > 0 {
+				entry["consecutive_fails"] = wInfo.ConsecutiveFails
 			}
 		}
 	}
@@ -1218,6 +1267,8 @@ func (h *Handler) buildAuthFromFileData(path string, data []byte) (*coreauth.Aut
 		}
 	}
 	coreauth.ApplyCustomHeadersFromMetadata(auth)
+	syncAuthFilePriorityAttribute(auth)
+	syncAuthFileWeightAttribute(auth)
 	return auth, nil
 }
 
@@ -1566,6 +1617,9 @@ func syncAuthFileMetadataFields(auth *coreauth.Auth, touchedRoots map[string]str
 	if _, ok := touchedRoots["priority"]; ok {
 		syncAuthFilePriorityAttribute(auth)
 	}
+	if _, ok := touchedRoots["weight"]; ok {
+		syncAuthFileWeightAttribute(auth)
+	}
 	if _, ok := touchedRoots["note"]; ok {
 		syncAuthFileNoteAttribute(auth)
 	}
@@ -1611,6 +1665,27 @@ func syncAuthFilePriorityAttribute(auth *coreauth.Auth) {
 		return
 	}
 	auth.Attributes["priority"] = strconv.Itoa(priority)
+}
+
+// syncAuthFileWeightAttribute syncs the weight Metadata field into Attributes["weight"].
+// Weight is clamped to [1, 100]; absent or invalid values default to 1 (uniform distribution).
+func syncAuthFileWeightAttribute(auth *coreauth.Auth) {
+	if auth == nil {
+		return
+	}
+	if auth.Attributes == nil {
+		auth.Attributes = make(map[string]string)
+	}
+	weight, ok := authFileIntValue(auth.Metadata["weight"])
+	if !ok || weight < 1 {
+		// No explicit weight or invalid → remove attribute (selector defaults to 1)
+		delete(auth.Attributes, "weight")
+		return
+	}
+	if weight > 100 {
+		weight = 100
+	}
+	auth.Attributes["weight"] = strconv.Itoa(weight)
 }
 
 func authFileIntValue(value any) (int, bool) {

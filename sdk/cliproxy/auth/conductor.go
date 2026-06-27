@@ -251,6 +251,10 @@ type Manager struct {
 	// It is initialized in NewManager; never Load() before first Store().
 	runtimeConfig atomic.Value
 
+	// autoWeight enables automatic weight adjustment based on health signals.
+	// When false, adjustWeight calls are no-ops.
+	autoWeight bool
+
 	// Optional HTTP RoundTripper provider injected by host.
 	rtProvider RoundTripperProvider
 
@@ -472,6 +476,23 @@ func (m *Manager) SetSelector(selector Selector) {
 		m.scheduler.setSelector(selector)
 		m.syncScheduler()
 	}
+}
+
+// SetAutoWeight enables or disables automatic weight adjustment based on health signals.
+func (m *Manager) SetAutoWeight(enabled bool) {
+	if m == nil {
+		return
+	}
+	m.autoWeight = enabled
+}
+
+// EffectiveWeightInfo returns the current weight state for an auth from the scheduler.
+// Returns nil if the scheduler is unavailable or the auth is not tracked.
+func (m *Manager) EffectiveWeightInfo(authID string) *WeightInfo {
+	if m == nil || m.scheduler == nil {
+		return nil
+	}
+	return m.scheduler.effectiveWeightInfo(authID)
 }
 
 // SetStore swaps the underlying persistence store.
@@ -3670,6 +3691,12 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		registry.GetGlobalRegistry().ResumeClientModel(result.AuthID, result.Model)
 	} else if shouldSuspendModel {
 		registry.GetGlobalRegistry().SuspendClientModel(result.AuthID, result.Model, suspendReason)
+	}
+
+	// Auto-adjust scheduling weight based on result health signal.
+	// Runs asynchronously to avoid contending with scheduler lock.
+	if m.autoWeight && m.scheduler != nil && result.Model != "" {
+		go m.scheduler.adjustWeight(result.AuthID, result.Model, result.Success)
 	}
 
 	m.hook.OnResult(ctx, result)

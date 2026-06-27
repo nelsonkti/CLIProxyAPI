@@ -187,6 +187,21 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 			}
 		}
 	}
+	// Read weight from auth file.
+	if rawWeight, ok := metadata["weight"]; ok {
+		switch v := rawWeight.(type) {
+		case float64:
+			w := int(v)
+			if w >= 1 && w <= 100 {
+				a.Attributes["weight"] = strconv.Itoa(w)
+			}
+		case string:
+			weight := strings.TrimSpace(v)
+			if parsed, errAtoi := strconv.Atoi(weight); errAtoi == nil && parsed >= 1 && parsed <= 100 {
+				a.Attributes["weight"] = strconv.Itoa(parsed)
+			}
+		}
+	}
 	// Read note from auth file.
 	if rawNote, ok := metadata["note"]; ok {
 		if note, isStr := rawNote.(string); isStr {
