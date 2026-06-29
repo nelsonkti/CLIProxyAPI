@@ -3703,6 +3703,67 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	m.publishErrorEvent(result, authSnapshot)
 }
 
+// ApplyQuotaThresholdCooldown proactively cools down a whole account when its
+// usage-window utilization has crossed the per-account threshold. The account
+// stays unavailable until recoverAt (the upstream 5-hour window reset). It is a
+// no-op when cooldown is disabled for the auth, when recoverAt is not in the
+// future, or when the account is already cooling on or past recoverAt.
+func (m *Manager) ApplyQuotaThresholdCooldown(ctx context.Context, authID string, recoverAt time.Time) {
+	if m == nil || authID == "" {
+		return
+	}
+	now := time.Now()
+	if !recoverAt.After(now) {
+		return
+	}
+
+	var authSnapshot *Auth
+	cooldownStateChanged := false
+
+	m.mu.Lock()
+	if auth, ok := m.auths[authID]; ok && auth != nil {
+		if m.cooldownDisabledForAuth(auth) {
+			m.mu.Unlock()
+			return
+		}
+		// Skip if already cooling down at least as long as the new target.
+		if auth.Unavailable && auth.NextRetryAfter.After(now) && !recoverAt.After(auth.NextRetryAfter) {
+			m.mu.Unlock()
+			return
+		}
+
+		var cooldownRecordsBefore []CooldownStateRecord
+		trackCooldownState := m.cooldownStore != nil
+		if trackCooldownState {
+			cooldownRecordsBefore = m.cooldownStateRecordsForAuthLocked(auth, now)
+		}
+
+		auth.Unavailable = true
+		auth.Status = StatusError
+		auth.StatusMessage = "quota threshold cooldown"
+		auth.UpdatedAt = now
+		auth.Quota.Exceeded = true
+		auth.Quota.Reason = "quota_threshold"
+		auth.Quota.NextRecoverAt = recoverAt
+		auth.NextRetryAfter = recoverAt
+
+		_ = m.persist(ctx, auth)
+		authSnapshot = auth.Clone()
+		if trackCooldownState {
+			cooldownRecordsAfter := m.cooldownStateRecordsForAuthLocked(auth, now)
+			cooldownStateChanged = !cooldownStateRecordsEqual(cooldownRecordsBefore, cooldownRecordsAfter)
+		}
+	}
+	m.mu.Unlock()
+
+	if m.scheduler != nil && authSnapshot != nil {
+		m.scheduler.upsertAuth(authSnapshot)
+	}
+	if authSnapshot != nil && cooldownStateChanged {
+		m.persistCooldownStates(context.Background())
+	}
+}
+
 func ensureModelState(auth *Auth, model string) *ModelState {
 	if auth == nil || model == "" {
 		return nil

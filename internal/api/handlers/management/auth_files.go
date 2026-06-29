@@ -82,6 +82,21 @@ func extractLastRefreshTimestamp(meta map[string]any) (time.Time, bool) {
 	return time.Time{}, false
 }
 
+// hasImportedAt reports whether the auth already carries a valid imported_at
+// stamp. A missing/invalid stamp identifies a brand-new import, which is used to
+// decide whether to apply first-import defaults (e.g. quota_cooldown_threshold).
+func hasImportedAt(auth *coreauth.Auth) bool {
+	if auth == nil || auth.Metadata == nil {
+		return false
+	}
+	raw, ok := auth.Metadata["imported_at"]
+	if !ok {
+		return false
+	}
+	_, valid := parseLastRefreshValue(raw)
+	return valid
+}
+
 // ensureImportedAt stamps the auth Metadata with an "imported_at" timestamp on
 // the first import only. It is never overwritten by later refreshes/updates,
 // so survival days can be computed from the original import time. The value is
@@ -1325,9 +1340,12 @@ func (h *Handler) buildAuthFromFileData(path string, data []byte) (*coreauth.Aut
 		}
 	}
 	coreauth.ApplyCustomHeadersFromMetadata(auth)
+	newImport := !hasImportedAt(auth)
 	ensureImportedAt(auth)
+	ensureQuotaCooldownThreshold(auth, newImport)
 	syncAuthFilePriorityAttribute(auth)
 	syncAuthFileWeightAttribute(auth)
+	syncAuthFileQuotaCooldownThreshold(auth)
 	return auth, nil
 }
 
@@ -1679,6 +1697,9 @@ func syncAuthFileMetadataFields(auth *coreauth.Auth, touchedRoots map[string]str
 	if _, ok := touchedRoots["weight"]; ok {
 		syncAuthFileWeightAttribute(auth)
 	}
+	if _, ok := touchedRoots["quota_cooldown_threshold"]; ok {
+		syncAuthFileQuotaCooldownThreshold(auth)
+	}
 	if _, ok := touchedRoots["note"]; ok {
 		syncAuthFileNoteAttribute(auth)
 	}
@@ -1745,6 +1766,50 @@ func syncAuthFileWeightAttribute(auth *coreauth.Auth) {
 		weight = 100
 	}
 	auth.Attributes["weight"] = strconv.Itoa(weight)
+}
+
+// defaultQuotaCooldownThreshold is the proactive-cooldown utilization percentage
+// stamped onto newly imported accounts only. Existing accounts (those already
+// carrying imported_at) are never stamped, so they default to 0 = no limit.
+const defaultQuotaCooldownThreshold = 40
+
+// ensureQuotaCooldownThreshold stamps a default quota_cooldown_threshold of 40
+// onto freshly imported accounts. It runs only when isNewImport is true and the
+// field is absent, so existing accounts keep 0 (no limit) and any user-provided
+// value (including an explicit 0) is preserved.
+func ensureQuotaCooldownThreshold(auth *coreauth.Auth, isNewImport bool) {
+	if auth == nil || !isNewImport {
+		return
+	}
+	if auth.Metadata == nil {
+		auth.Metadata = make(map[string]any)
+	}
+	if _, ok := auth.Metadata["quota_cooldown_threshold"]; ok {
+		return
+	}
+	auth.Metadata["quota_cooldown_threshold"] = defaultQuotaCooldownThreshold
+}
+
+// syncAuthFileQuotaCooldownThreshold syncs the quota_cooldown_threshold Metadata
+// field into Attributes["quota_cooldown_threshold"]. Absent, invalid, or <=0
+// values remove the attribute (no limit); otherwise the value is clamped to
+// [1, 100].
+func syncAuthFileQuotaCooldownThreshold(auth *coreauth.Auth) {
+	if auth == nil {
+		return
+	}
+	if auth.Attributes == nil {
+		auth.Attributes = make(map[string]string)
+	}
+	threshold, ok := authFileIntValue(auth.Metadata["quota_cooldown_threshold"])
+	if !ok || threshold <= 0 {
+		delete(auth.Attributes, "quota_cooldown_threshold")
+		return
+	}
+	if threshold > 100 {
+		threshold = 100
+	}
+	auth.Attributes["quota_cooldown_threshold"] = strconv.Itoa(threshold)
 }
 
 func authFileIntValue(value any) (int, bool) {
@@ -1933,7 +1998,10 @@ func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (s
 	if record == nil {
 		return "", fmt.Errorf("token record is nil")
 	}
+	newImport := !hasImportedAt(record)
 	ensureImportedAt(record)
+	ensureQuotaCooldownThreshold(record, newImport)
+	syncAuthFileQuotaCooldownThreshold(record)
 	store := h.tokenStoreWithBaseDir()
 	if store == nil {
 		return "", fmt.Errorf("token store unavailable")

@@ -392,10 +392,13 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 						return true, blockReasonOther, next
 					}
 				}
-				return false, blockReasonNone, time.Time{}
+				// Per-model state is clean; fall through to the auth-level gate
+				// so per-account cooldown (e.g. proactive quota threshold) still
+				// blocks every model on this account.
 			}
 		}
-		return false, blockReasonNone, time.Time{}
+		// No model state (or a clean one): the auth-level cooldown below is the
+		// final authority for per-account blocking.
 	}
 	if auth.Unavailable && auth.NextRetryAfter.After(now) {
 		next := auth.NextRetryAfter
