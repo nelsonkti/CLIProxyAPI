@@ -82,6 +82,40 @@ func extractLastRefreshTimestamp(meta map[string]any) (time.Time, bool) {
 	return time.Time{}, false
 }
 
+// ensureImportedAt stamps the auth Metadata with an "imported_at" timestamp on
+// the first import only. It is never overwritten by later refreshes/updates,
+// so survival days can be computed from the original import time. The value is
+// stored as an RFC3339 string (a top-level metadata JSON key, like priority/weight).
+func ensureImportedAt(auth *coreauth.Auth) {
+	if auth == nil {
+		return
+	}
+	if auth.Metadata == nil {
+		auth.Metadata = make(map[string]any)
+	}
+	if raw, ok := auth.Metadata["imported_at"]; ok {
+		if _, valid := parseLastRefreshValue(raw); valid {
+			return
+		}
+	}
+	auth.Metadata["imported_at"] = time.Now().UTC().Format(time.RFC3339)
+}
+
+// survivalDaysFromImportedAt returns the number of whole days the auth has been
+// imported (now - imported_at), and whether an imported_at value was present.
+// Negative results (clock skew / future timestamp) are clamped to 0.
+func survivalDaysFromImportedAt(imported any, now time.Time) (int, bool) {
+	ts, ok := parseLastRefreshValue(imported)
+	if !ok {
+		return 0, false
+	}
+	days := int(now.UTC().Sub(ts) / (24 * time.Hour))
+	if days < 0 {
+		days = 0
+	}
+	return days, true
+}
+
 func parseLastRefreshValue(v any) (time.Time, bool) {
 	switch val := v.(type) {
 	case string:
@@ -442,6 +476,21 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
 						fileData["note"] = trimmed
 					}
 				}
+				if iv := gjson.GetBytes(data, "imported_at"); iv.Exists() {
+					var rawImported any
+					switch iv.Type {
+					case gjson.Number:
+						rawImported = iv.Int()
+					case gjson.String:
+						rawImported = iv.String()
+					}
+					if rawImported != nil {
+						if days, valid := survivalDaysFromImportedAt(rawImported, time.Now()); valid {
+							fileData["imported_at"] = rawImported
+							fileData["survival_days"] = days
+						}
+					}
+				}
 				if wv := gjson.GetBytes(data, "websockets"); wv.Exists() {
 					switch wv.Type {
 					case gjson.True:
@@ -615,6 +664,15 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 	}
 	if websockets, ok := authWebsocketsValue(auth); ok {
 		entry["websockets"] = websockets
+	}
+	// Expose imported_at and derived survival_days (whole days since first import).
+	if auth.Metadata != nil {
+		if raw, ok := auth.Metadata["imported_at"]; ok {
+			if days, valid := survivalDaysFromImportedAt(raw, time.Now()); valid {
+				entry["imported_at"] = raw
+				entry["survival_days"] = days
+			}
+		}
 	}
 	return entry
 }
@@ -1267,6 +1325,7 @@ func (h *Handler) buildAuthFromFileData(path string, data []byte) (*coreauth.Aut
 		}
 	}
 	coreauth.ApplyCustomHeadersFromMetadata(auth)
+	ensureImportedAt(auth)
 	syncAuthFilePriorityAttribute(auth)
 	syncAuthFileWeightAttribute(auth)
 	return auth, nil
@@ -1874,6 +1933,7 @@ func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (s
 	if record == nil {
 		return "", fmt.Errorf("token record is nil")
 	}
+	ensureImportedAt(record)
 	store := h.tokenStoreWithBaseDir()
 	if store == nil {
 		return "", fmt.Errorf("token store unavailable")
