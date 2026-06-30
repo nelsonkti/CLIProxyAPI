@@ -90,23 +90,31 @@ func (m *Manager) runQuotaThresholdProbe(ctx context.Context, authID string) {
 
 	result, okProbe := probe.probe(ctx, cloned)
 	if !okProbe {
+		log.Debugf("quota threshold probe: provider=%s auth=%s usage fetch failed; skipping cooldown evaluation",
+			cloned.Provider, cloned.ID)
 		return
 	}
 	// Threshold matches the UI's remaining-quota percentage: cool down once the
 	// remaining quota falls below the configured value.
 	remainingPercent := 100 - result.usedPercent
 	if remainingPercent >= float64(threshold) {
+		log.Debugf("quota threshold probe: provider=%s auth=%s remaining=%.1f%% >= threshold=%d%%; no cooldown",
+			cloned.Provider, cloned.ID, remainingPercent, threshold)
 		return
 	}
 	recoverAt := result.resetAt
 	if recoverAt.IsZero() || !recoverAt.After(now) {
+		// Remaining quota is below the threshold but the upstream reset time is
+		// missing or not in the future, so the cooldown window cannot be bounded.
+		log.Warnf("quota threshold probe: provider=%s auth=%s remaining=%.1f%% below threshold=%d%% but reset time is invalid (resetAt=%s); cooldown skipped",
+			cloned.Provider, cloned.ID, remainingPercent, threshold, result.resetAt.Format(time.RFC3339))
 		return
 	}
 	if recoverAt.Sub(now) > quotaThresholdCooldownMaxCap {
 		recoverAt = now.Add(quotaThresholdCooldownMaxCap)
 	}
 
-	log.Debugf("quota threshold cooldown: provider=%s auth=%s remaining=%.1f%% used=%.1f%% threshold=%d%% until=%s",
+	log.Infof("quota threshold cooldown: provider=%s auth=%s remaining=%.1f%% used=%.1f%% threshold=%d%% until=%s",
 		cloned.Provider, cloned.ID, remainingPercent, result.usedPercent, threshold, recoverAt.Format(time.RFC3339))
 	m.ApplyQuotaThresholdCooldown(ctx, authID, recoverAt)
 }
@@ -285,19 +293,49 @@ func codexAccountID(auth *Auth) string {
 	return ""
 }
 
-// parseResetTimestamp parses an ISO-8601 timestamp from a gjson result.
+// parseResetTimestamp parses a reset timestamp from a gjson result. It accepts a
+// numeric Unix timestamp (seconds or milliseconds) and several common string
+// layouts (RFC3339 with/without fractional seconds and timezone-less ISO-8601),
+// mirroring the lenient parsing the UI performs via JavaScript Date. Returns the
+// zero time when the value is absent or unparseable.
 func parseResetTimestamp(value gjson.Result) time.Time {
 	if !value.Exists() {
 		return time.Time{}
+	}
+	if value.Type == gjson.Number {
+		return unixTimestamp(value.Int())
 	}
 	raw := strings.TrimSpace(value.String())
 	if raw == "" {
 		return time.Time{}
 	}
-	if ts, err := time.Parse(time.RFC3339, raw); err == nil {
-		return ts
+	for _, layout := range []string{
+		time.RFC3339Nano,
+		time.RFC3339,
+		"2006-01-02T15:04:05",
+		"2006-01-02 15:04:05",
+	} {
+		if ts, err := time.Parse(layout, raw); err == nil {
+			return ts
+		}
+	}
+	if n, err := strconv.ParseInt(raw, 10, 64); err == nil {
+		return unixTimestamp(n)
 	}
 	return time.Time{}
+}
+
+// unixTimestamp converts a positive Unix timestamp in seconds or milliseconds to
+// a time.Time, returning the zero time for non-positive input.
+func unixTimestamp(n int64) time.Time {
+	if n <= 0 {
+		return time.Time{}
+	}
+	// Values past this bound are milliseconds (year ~33658 in seconds).
+	if n > 1e12 {
+		return time.UnixMilli(n)
+	}
+	return time.Unix(n, 0)
 }
 
 // codexResetTimestamp resolves the window reset time from reset_at (unix
