@@ -20,8 +20,6 @@ pgstore/*
 gitstore/*
 objectstore/*
 
-# Static assets
-static/*
 
 # Authentication data
 auths/*
