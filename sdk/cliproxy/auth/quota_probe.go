@@ -51,10 +51,13 @@ func quotaProbeForProvider(provider string) quotaProbe {
 	}
 }
 
-// runQuotaThresholdProbe checks a single account's 5-hour utilization against
-// its per-account threshold and, when exceeded, proactively cools the whole
-// account until the window reset. It is a no-op for accounts without a
-// threshold, already-cooled accounts, or unsupported providers.
+// runQuotaThresholdProbe checks a single account's 5-hour remaining quota
+// against its per-account threshold and, when the remaining quota drops below
+// the threshold, proactively cools the whole account until the window reset.
+// The threshold is expressed as the remaining-quota percentage shown in the UI
+// (e.g. threshold 60 cools down once less than 60% quota remains). It is a no-op
+// for accounts without a threshold, already-cooled accounts, or unsupported
+// providers.
 func (m *Manager) runQuotaThresholdProbe(ctx context.Context, authID string) {
 	if m == nil || authID == "" {
 		return
@@ -89,7 +92,10 @@ func (m *Manager) runQuotaThresholdProbe(ctx context.Context, authID string) {
 	if !okProbe {
 		return
 	}
-	if result.usedPercent < float64(threshold) {
+	// Threshold matches the UI's remaining-quota percentage: cool down once the
+	// remaining quota falls below the configured value.
+	remainingPercent := 100 - result.usedPercent
+	if remainingPercent >= float64(threshold) {
 		return
 	}
 	recoverAt := result.resetAt
@@ -100,8 +106,8 @@ func (m *Manager) runQuotaThresholdProbe(ctx context.Context, authID string) {
 		recoverAt = now.Add(quotaThresholdCooldownMaxCap)
 	}
 
-	log.Debugf("quota threshold cooldown: provider=%s auth=%s used=%.1f%% threshold=%d%% until=%s",
-		cloned.Provider, cloned.ID, result.usedPercent, threshold, recoverAt.Format(time.RFC3339))
+	log.Debugf("quota threshold cooldown: provider=%s auth=%s remaining=%.1f%% used=%.1f%% threshold=%d%% until=%s",
+		cloned.Provider, cloned.ID, remainingPercent, result.usedPercent, threshold, recoverAt.Format(time.RFC3339))
 	m.ApplyQuotaThresholdCooldown(ctx, authID, recoverAt)
 }
 
