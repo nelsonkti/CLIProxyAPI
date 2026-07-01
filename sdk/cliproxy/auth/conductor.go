@@ -263,6 +263,12 @@ type Manager struct {
 	refreshLoop   *authAutoRefreshLoop
 
 	requestPrepareLocks sync.Map
+
+	// lastUIUsageFetchAt records, per auth ID, the last time the management
+	// api-call path observed a usage-endpoint response for that auth. The
+	// proactive quota probe consults it to skip a redundant upstream fetch
+	// when the UI has already pulled usage within the current probe interval.
+	lastUIUsageFetchAt map[string]time.Time
 }
 
 // NewManager constructs a manager with optional custom selector and hook.
@@ -274,14 +280,15 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 		hook = NoopHook{}
 	}
 	manager := &Manager{
-		store:            store,
-		executors:        make(map[string]ProviderExecutor),
-		selector:         selector,
-		hook:             hook,
-		auths:            make(map[string]*Auth),
-		homeRuntimeAuths: make(map[string]map[string]*Auth),
-		providerOffsets:  make(map[string]int),
-		modelPoolOffsets: make(map[string]int),
+		store:              store,
+		executors:          make(map[string]ProviderExecutor),
+		selector:           selector,
+		hook:               hook,
+		auths:              make(map[string]*Auth),
+		homeRuntimeAuths:   make(map[string]map[string]*Auth),
+		providerOffsets:    make(map[string]int),
+		modelPoolOffsets:   make(map[string]int),
+		lastUIUsageFetchAt: make(map[string]time.Time),
 	}
 	// atomic.Value requires non-nil initial value.
 	manager.runtimeConfig.Store(&internalconfig.Config{})
@@ -2216,6 +2223,7 @@ func (m *Manager) Remove(ctx context.Context, id string) {
 	if m.modelPoolOffsets != nil {
 		delete(m.modelPoolOffsets, id)
 	}
+	delete(m.lastUIUsageFetchAt, id)
 	for sessionID, sessionAuths := range m.homeRuntimeAuths {
 		if sessionAuths == nil {
 			continue

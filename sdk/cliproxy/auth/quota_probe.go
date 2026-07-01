@@ -51,6 +51,89 @@ func quotaProbeForProvider(provider string) quotaProbe {
 	}
 }
 
+// usageBodyParserForURL returns the body parser for a known usage endpoint, or
+// nil when rawURL is not a recognized usage URL. The parser is reused by the
+// proactive probe and the reactive management api-call path so the body is
+// interpreted identically. Comparison is on the normalized
+// scheme://host/path (host lowercased, trailing slash trimmed, query and
+// fragment ignored) so that callers may pass the request URL verbatim.
+func usageBodyParserForURL(rawURL string) func([]byte) (quotaProbeResult, bool) {
+	normalized, ok := normalizeUsageURL(rawURL)
+	if !ok {
+		return nil
+	}
+	switch normalized {
+	case claudeUsageURL:
+		return parseClaudeUsageBody
+	case codexUsageURL:
+		return parseCodexUsageBody
+	default:
+		return nil
+	}
+}
+
+// normalizeUsageURL parses rawURL and returns a normalized
+// scheme://host/path string (host lowercased, path trailing-slash trimmed) for
+// comparison against the known usage endpoint constants. Returns false when
+// rawURL cannot be parsed or is missing scheme/host.
+func normalizeUsageURL(rawURL string) (string, bool) {
+	if strings.TrimSpace(rawURL) == "" {
+		return "", false
+	}
+	parsed, errParse := url.Parse(rawURL)
+	if errParse != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return "", false
+	}
+	host := strings.ToLower(parsed.Host)
+	path := strings.Trim(parsed.Path, "/")
+	if path == "" {
+		return parsed.Scheme + "://" + host, true
+	}
+	return parsed.Scheme + "://" + host + "/" + path, true
+}
+
+// ApplyQuotaCooldownFromUsageResponse evaluates a fetched usage response body
+// and applies the per-account quota threshold cooldown when the remaining
+// quota is below the threshold. It lets the management api-call endpoint apply
+// cooldown immediately on the UI's manual usage fetch, instead of waiting for
+// the next proactive probe tick. It is a no-op when requestURL is not a
+// recognized usage endpoint, the account has no threshold, cooldown is
+// disabled, is already cooling, or the remaining quota is above the threshold.
+// body may be nil/empty.
+func (m *Manager) ApplyQuotaCooldownFromUsageResponse(ctx context.Context, authID, requestURL string, body []byte) {
+	if m == nil || authID == "" {
+		return
+	}
+	parser := usageBodyParserForURL(requestURL)
+	if parser == nil {
+		return
+	}
+	m.mu.RLock()
+	auth := m.auths[authID]
+	var cloned *Auth
+	if auth != nil {
+		cloned = auth.Clone()
+	}
+	m.mu.RUnlock()
+	if cloned == nil {
+		return
+	}
+	// Only record a UI fetch timestamp when the account actually opts into
+	// per-account threshold cooldown; otherwise the proactive probe never
+	// inspects this account and the timestamp would be dead data that could
+	// suppress a future probe right after a threshold is configured.
+	if _, hasThreshold := quotaCooldownThreshold(cloned); hasThreshold {
+		m.mu.Lock()
+		m.lastUIUsageFetchAt[authID] = time.Now()
+		m.mu.Unlock()
+	}
+	if len(body) == 0 {
+		return
+	}
+	result, okProbe := parser(body)
+	m.evaluateAndApplyQuotaCooldown(ctx, cloned, result, okProbe)
+}
+
 // runQuotaThresholdProbe checks a single account's 5-hour remaining quota
 // against its per-account threshold and, when the remaining quota drops below
 // the threshold, proactively cools the whole account until the window reset.
@@ -60,6 +143,17 @@ func quotaProbeForProvider(provider string) quotaProbe {
 // providers.
 func (m *Manager) runQuotaThresholdProbe(ctx context.Context, authID string) {
 	if m == nil || authID == "" {
+		return
+	}
+	// Defer to the UI-fetched path: if the management api-call endpoint
+	// observed a usage fetch for this auth within the current probe
+	// interval, the proactive probe would only duplicate that upstream
+	// request, so skip it. The safety net remains for accounts the UI
+	// never refreshes.
+	m.mu.RLock()
+	last := m.lastUIUsageFetchAt[authID]
+	m.mu.RUnlock()
+	if !last.IsZero() && time.Since(last) < refreshCheckInterval {
 		return
 	}
 	m.mu.RLock()
@@ -73,11 +167,16 @@ func (m *Manager) runQuotaThresholdProbe(ctx context.Context, authID string) {
 		return
 	}
 
-	threshold, ok := quotaCooldownThreshold(cloned)
-	if !ok {
+	// Skip accounts that did not opt into per-account threshold cooldown or
+	// have cooldown disabled entirely. This guard must run before the probe
+	// fires an upstream usage request so non-opted accounts are never
+	// contacted.
+	if _, hasThreshold := quotaCooldownThreshold(cloned); !hasThreshold || m.cooldownDisabledForAuth(cloned) {
 		return
 	}
-	// Skip accounts already cooling down.
+
+	// Skip accounts already cooling down to avoid firing an unnecessary
+	// upstream usage request.
 	now := time.Now()
 	if cloned.Unavailable && cloned.NextRetryAfter.After(now) {
 		return
@@ -89,9 +188,32 @@ func (m *Manager) runQuotaThresholdProbe(ctx context.Context, authID string) {
 	}
 
 	result, okProbe := probe.probe(ctx, cloned)
+	m.evaluateAndApplyQuotaCooldown(ctx, cloned, result, okProbe)
+}
+
+// evaluateAndApplyQuotaCooldown is the single source of truth for the
+// threshold->cooldown policy. It reads the per-account threshold, skips
+// accounts already cooling down, computes the remaining-quota percentage,
+// validates and caps the upstream reset time, and applies the cooldown via
+// ApplyQuotaThresholdCooldown. It is shared by the proactive probe
+// (runQuotaThresholdProbe) and the reactive management api-call path
+// (ApplyQuotaCooldownFromUsageResponse) so the two paths cannot drift.
+func (m *Manager) evaluateAndApplyQuotaCooldown(ctx context.Context, auth *Auth, result quotaProbeResult, okProbe bool) {
+	if m == nil || auth == nil {
+		return
+	}
+	threshold, ok := quotaCooldownThreshold(auth)
+	if !ok || m.cooldownDisabledForAuth(auth) {
+		return
+	}
+	// Skip accounts already cooling down.
+	now := time.Now()
+	if auth.Unavailable && auth.NextRetryAfter.After(now) {
+		return
+	}
 	if !okProbe {
 		log.Debugf("quota threshold probe: provider=%s auth=%s usage fetch failed; skipping cooldown evaluation",
-			cloned.Provider, cloned.ID)
+			auth.Provider, auth.ID)
 		return
 	}
 	// Threshold matches the UI's remaining-quota percentage: cool down once the
@@ -99,7 +221,7 @@ func (m *Manager) runQuotaThresholdProbe(ctx context.Context, authID string) {
 	remainingPercent := 100 - result.usedPercent
 	if remainingPercent >= float64(threshold) {
 		log.Debugf("quota threshold probe: provider=%s auth=%s remaining=%.1f%% >= threshold=%d%%; no cooldown",
-			cloned.Provider, cloned.ID, remainingPercent, threshold)
+			auth.Provider, auth.ID, remainingPercent, threshold)
 		return
 	}
 	recoverAt := result.resetAt
@@ -107,7 +229,7 @@ func (m *Manager) runQuotaThresholdProbe(ctx context.Context, authID string) {
 		// Remaining quota is below the threshold but the upstream reset time is
 		// missing or not in the future, so the cooldown window cannot be bounded.
 		log.Warnf("quota threshold probe: provider=%s auth=%s remaining=%.1f%% below threshold=%d%% but reset time is invalid (resetAt=%s); cooldown skipped",
-			cloned.Provider, cloned.ID, remainingPercent, threshold, result.resetAt.Format(time.RFC3339))
+			auth.Provider, auth.ID, remainingPercent, threshold, result.resetAt.Format(time.RFC3339))
 		return
 	}
 	if recoverAt.Sub(now) > quotaThresholdCooldownMaxCap {
@@ -115,8 +237,8 @@ func (m *Manager) runQuotaThresholdProbe(ctx context.Context, authID string) {
 	}
 
 	log.Infof("quota threshold cooldown: provider=%s auth=%s remaining=%.1f%% used=%.1f%% threshold=%d%% until=%s",
-		cloned.Provider, cloned.ID, remainingPercent, result.usedPercent, threshold, recoverAt.Format(time.RFC3339))
-	m.ApplyQuotaThresholdCooldown(ctx, authID, recoverAt)
+		auth.Provider, auth.ID, remainingPercent, result.usedPercent, threshold, recoverAt.Format(time.RFC3339))
+	m.ApplyQuotaThresholdCooldown(ctx, auth.ID, recoverAt)
 }
 
 // quotaCooldownThreshold reads the per-account threshold from attributes.
@@ -225,6 +347,13 @@ func (claudeQuotaProbe) probe(ctx context.Context, auth *Auth) (quotaProbeResult
 	if !ok {
 		return quotaProbeResult{}, false
 	}
+	return parseClaudeUsageBody(body)
+}
+
+// parseClaudeUsageBody extracts the five_hour window utilization and reset time
+// from a Claude usage response body. It is shared by the proactive probe and
+// the reactive management api-call path so both interpret the body identically.
+func parseClaudeUsageBody(body []byte) (quotaProbeResult, bool) {
 	window := gjson.GetBytes(body, "five_hour")
 	if !window.Exists() {
 		return quotaProbeResult{}, false
@@ -256,6 +385,13 @@ func (codexQuotaProbe) probe(ctx context.Context, auth *Auth) (quotaProbeResult,
 	if !ok {
 		return quotaProbeResult{}, false
 	}
+	return parseCodexUsageBody(body)
+}
+
+// parseCodexUsageBody locates the 5-hour window (limit_window_seconds=18000) in
+// a Codex usage response body and returns its used_percent and reset time. It
+// is shared by the proactive probe and the reactive management api-call path.
+func parseCodexUsageBody(body []byte) (quotaProbeResult, bool) {
 	// Locate the window whose limit_window_seconds marks the 5-hour tier.
 	for _, path := range []string{"rate_limit.primary_window", "rate_limit.secondary_window"} {
 		window := gjson.GetBytes(body, path)
