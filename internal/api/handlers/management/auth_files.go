@@ -82,6 +82,55 @@ func extractLastRefreshTimestamp(meta map[string]any) (time.Time, bool) {
 	return time.Time{}, false
 }
 
+// hasImportedAt reports whether the auth already carries a valid imported_at
+// stamp. A missing/invalid stamp identifies a brand-new import, which is used to
+// decide whether to apply first-import defaults (e.g. quota_cooldown_threshold).
+func hasImportedAt(auth *coreauth.Auth) bool {
+	if auth == nil || auth.Metadata == nil {
+		return false
+	}
+	raw, ok := auth.Metadata["imported_at"]
+	if !ok {
+		return false
+	}
+	_, valid := parseLastRefreshValue(raw)
+	return valid
+}
+
+// ensureImportedAt stamps the auth Metadata with an "imported_at" timestamp on
+// the first import only. It is never overwritten by later refreshes/updates,
+// so survival days can be computed from the original import time. The value is
+// stored as an RFC3339 string (a top-level metadata JSON key, like priority/weight).
+func ensureImportedAt(auth *coreauth.Auth) {
+	if auth == nil {
+		return
+	}
+	if auth.Metadata == nil {
+		auth.Metadata = make(map[string]any)
+	}
+	if raw, ok := auth.Metadata["imported_at"]; ok {
+		if _, valid := parseLastRefreshValue(raw); valid {
+			return
+		}
+	}
+	auth.Metadata["imported_at"] = time.Now().UTC().Format(time.RFC3339)
+}
+
+// survivalDaysFromImportedAt returns the number of whole days the auth has been
+// imported (now - imported_at), and whether an imported_at value was present.
+// Negative results (clock skew / future timestamp) are clamped to 0.
+func survivalDaysFromImportedAt(imported any, now time.Time) (int, bool) {
+	ts, ok := parseLastRefreshValue(imported)
+	if !ok {
+		return 0, false
+	}
+	days := int(now.UTC().Sub(ts) / (24 * time.Hour))
+	if days < 0 {
+		days = 0
+	}
+	return days, true
+}
+
 func parseLastRefreshValue(v any) (time.Time, bool) {
 	switch val := v.(type) {
 	case string:
@@ -427,9 +476,34 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
 						}
 					}
 				}
+				if wv := gjson.GetBytes(data, "weight"); wv.Exists() {
+					switch wv.Type {
+					case gjson.Number:
+						fileData["weight"] = int(wv.Int())
+					case gjson.String:
+						if parsed, errAtoi := strconv.Atoi(strings.TrimSpace(wv.String())); errAtoi == nil {
+							fileData["weight"] = parsed
+						}
+					}
+				}
 				if nv := gjson.GetBytes(data, "note"); nv.Exists() && nv.Type == gjson.String {
 					if trimmed := strings.TrimSpace(nv.String()); trimmed != "" {
 						fileData["note"] = trimmed
+					}
+				}
+				if iv := gjson.GetBytes(data, "imported_at"); iv.Exists() {
+					var rawImported any
+					switch iv.Type {
+					case gjson.Number:
+						rawImported = iv.Int()
+					case gjson.String:
+						rawImported = iv.String()
+					}
+					if rawImported != nil {
+						if days, valid := survivalDaysFromImportedAt(rawImported, time.Now()); valid {
+							fileData["imported_at"] = rawImported
+							fileData["survival_days"] = days
+						}
 					}
 				}
 				if wv := gjson.GetBytes(data, "websockets"); wv.Exists() {
@@ -553,6 +627,45 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 			}
 		}
 	}
+	// Expose weight from Attributes (set by synthesizer from JSON "weight" field).
+	// Fall back to Metadata for auths registered via UploadAuthFile (no synthesizer).
+	// Default weight is 0 (not set, treated as 1 for uniform distribution by scheduler).
+	weight := 0
+	if w := strings.TrimSpace(authAttribute(auth, "weight")); w != "" {
+		if parsed, err := strconv.Atoi(w); err == nil && parsed >= 1 {
+			weight = parsed
+		}
+	} else if auth.Metadata != nil {
+		if rawWeight, ok := auth.Metadata["weight"]; ok {
+			switch v := rawWeight.(type) {
+			case float64:
+				if int(v) >= 1 {
+					weight = int(v)
+				}
+			case int:
+				if v >= 1 {
+					weight = v
+				}
+			case string:
+				if parsed, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && parsed >= 1 {
+					weight = parsed
+				}
+			}
+		}
+	}
+	if weight > 100 {
+		weight = 100
+	}
+	entry["weight"] = weight
+	// Expose effective_weight from scheduler (auto-adjusted weight, may differ from base weight).
+	if h.authManager != nil {
+		if wInfo := h.authManager.EffectiveWeightInfo(auth.ID); wInfo != nil {
+			entry["effective_weight"] = wInfo.EffectiveWeight
+			if wInfo.ConsecutiveFails > 0 {
+				entry["consecutive_fails"] = wInfo.ConsecutiveFails
+			}
+		}
+	}
 	// Expose note from Attributes (set by synthesizer from JSON "note" field).
 	// Fall back to Metadata for auths registered via UploadAuthFile (no synthesizer).
 	if note := strings.TrimSpace(authAttribute(auth, "note")); note != "" {
@@ -566,6 +679,15 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 	}
 	if websockets, ok := authWebsocketsValue(auth); ok {
 		entry["websockets"] = websockets
+	}
+	// Expose imported_at and derived survival_days (whole days since first import).
+	if auth.Metadata != nil {
+		if raw, ok := auth.Metadata["imported_at"]; ok {
+			if days, valid := survivalDaysFromImportedAt(raw, time.Now()); valid {
+				entry["imported_at"] = raw
+				entry["survival_days"] = days
+			}
+		}
 	}
 	return entry
 }
@@ -1218,6 +1340,12 @@ func (h *Handler) buildAuthFromFileData(path string, data []byte) (*coreauth.Aut
 		}
 	}
 	coreauth.ApplyCustomHeadersFromMetadata(auth)
+	newImport := !hasImportedAt(auth)
+	ensureImportedAt(auth)
+	ensureQuotaCooldownThreshold(auth, newImport)
+	syncAuthFilePriorityAttribute(auth)
+	syncAuthFileWeightAttribute(auth)
+	syncAuthFileQuotaCooldownThreshold(auth)
 	return auth, nil
 }
 
@@ -1566,6 +1694,12 @@ func syncAuthFileMetadataFields(auth *coreauth.Auth, touchedRoots map[string]str
 	if _, ok := touchedRoots["priority"]; ok {
 		syncAuthFilePriorityAttribute(auth)
 	}
+	if _, ok := touchedRoots["weight"]; ok {
+		syncAuthFileWeightAttribute(auth)
+	}
+	if _, ok := touchedRoots["quota_cooldown_threshold"]; ok {
+		syncAuthFileQuotaCooldownThreshold(auth)
+	}
 	if _, ok := touchedRoots["note"]; ok {
 		syncAuthFileNoteAttribute(auth)
 	}
@@ -1611,6 +1745,71 @@ func syncAuthFilePriorityAttribute(auth *coreauth.Auth) {
 		return
 	}
 	auth.Attributes["priority"] = strconv.Itoa(priority)
+}
+
+// syncAuthFileWeightAttribute syncs the weight Metadata field into Attributes["weight"].
+// Weight is clamped to [1, 100]; absent or invalid values default to 1 (uniform distribution).
+func syncAuthFileWeightAttribute(auth *coreauth.Auth) {
+	if auth == nil {
+		return
+	}
+	if auth.Attributes == nil {
+		auth.Attributes = make(map[string]string)
+	}
+	weight, ok := authFileIntValue(auth.Metadata["weight"])
+	if !ok || weight < 1 {
+		// No explicit weight or invalid → remove attribute (selector defaults to 1)
+		delete(auth.Attributes, "weight")
+		return
+	}
+	if weight > 100 {
+		weight = 100
+	}
+	auth.Attributes["weight"] = strconv.Itoa(weight)
+}
+
+// defaultQuotaCooldownThreshold is the proactive-cooldown utilization percentage
+// stamped onto newly imported accounts only. Existing accounts (those already
+// carrying imported_at) are never stamped, so they default to 0 = no limit.
+const defaultQuotaCooldownThreshold = 40
+
+// ensureQuotaCooldownThreshold stamps a default quota_cooldown_threshold of 40
+// onto freshly imported accounts. It runs only when isNewImport is true and the
+// field is absent, so existing accounts keep 0 (no limit) and any user-provided
+// value (including an explicit 0) is preserved.
+func ensureQuotaCooldownThreshold(auth *coreauth.Auth, isNewImport bool) {
+	if auth == nil || !isNewImport {
+		return
+	}
+	if auth.Metadata == nil {
+		auth.Metadata = make(map[string]any)
+	}
+	if _, ok := auth.Metadata["quota_cooldown_threshold"]; ok {
+		return
+	}
+	auth.Metadata["quota_cooldown_threshold"] = defaultQuotaCooldownThreshold
+}
+
+// syncAuthFileQuotaCooldownThreshold syncs the quota_cooldown_threshold Metadata
+// field into Attributes["quota_cooldown_threshold"]. Absent, invalid, or <=0
+// values remove the attribute (no limit); otherwise the value is clamped to
+// [1, 100].
+func syncAuthFileQuotaCooldownThreshold(auth *coreauth.Auth) {
+	if auth == nil {
+		return
+	}
+	if auth.Attributes == nil {
+		auth.Attributes = make(map[string]string)
+	}
+	threshold, ok := authFileIntValue(auth.Metadata["quota_cooldown_threshold"])
+	if !ok || threshold <= 0 {
+		delete(auth.Attributes, "quota_cooldown_threshold")
+		return
+	}
+	if threshold > 100 {
+		threshold = 100
+	}
+	auth.Attributes["quota_cooldown_threshold"] = strconv.Itoa(threshold)
 }
 
 func authFileIntValue(value any) (int, bool) {
@@ -1799,6 +1998,10 @@ func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (s
 	if record == nil {
 		return "", fmt.Errorf("token record is nil")
 	}
+	newImport := !hasImportedAt(record)
+	ensureImportedAt(record)
+	ensureQuotaCooldownThreshold(record, newImport)
+	syncAuthFileQuotaCooldownThreshold(record)
 	store := h.tokenStoreWithBaseDir()
 	if store == nil {
 		return "", fmt.Errorf("token store unavailable")

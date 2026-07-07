@@ -234,7 +234,18 @@ func (l *authAutoRefreshLoop) handleDueAuth(ctx context.Context, now time.Time, 
 	next, shouldSchedule := nextRefreshCheckAt(now, auth, l.interval)
 	shouldRefresh := manager.shouldRefresh(auth, now)
 	exec := manager.executors[auth.Provider]
+	_, hasThreshold := quotaCooldownThreshold(auth)
 	manager.mu.RUnlock()
+
+	// Proactive quota probe rides the same loop. Accounts with a per-account
+	// threshold are probed on the interval cadence regardless of token refresh.
+	if hasThreshold {
+		l.manager.runQuotaThresholdProbe(ctx, authID)
+		if next.IsZero() || next.After(now.Add(l.interval)) {
+			next = now.Add(l.interval)
+			shouldSchedule = true
+		}
+	}
 
 	if !shouldSchedule {
 		l.remove(authID)
@@ -347,6 +358,23 @@ func nextRefreshCheckAt(now time.Time, auth *Auth, interval time.Duration) (time
 		return time.Time{}, false
 	}
 
+	next, ok := refreshCheckSchedule(now, auth, interval)
+
+	// Accounts with a proactive quota threshold must be revisited at least once
+	// per interval so the usage probe can run on a steady cadence.
+	if _, hasThreshold := quotaCooldownThreshold(auth); hasThreshold {
+		if interval <= 0 {
+			interval = refreshCheckInterval
+		}
+		probeNext := now.Add(interval)
+		if !ok || next.IsZero() || next.After(probeNext) {
+			return probeNext, true
+		}
+	}
+	return next, ok
+}
+
+func refreshCheckSchedule(now time.Time, auth *Auth, interval time.Duration) (time.Time, bool) {
 	if !auth.NextRefreshAfter.IsZero() && now.Before(auth.NextRefreshAfter) {
 		return auth.NextRefreshAfter, true
 	}

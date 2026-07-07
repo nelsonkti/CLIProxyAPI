@@ -17,6 +17,10 @@ type VertexCompatKey struct {
 	// Higher values are preferred; defaults to 0.
 	Priority int `yaml:"priority,omitempty" json:"priority,omitempty"`
 
+	// Weight controls proportional request distribution within the same priority tier.
+	// Range [1, 100]; 0 means unset (treated as 1 for uniform distribution).
+	Weight int `yaml:"weight,omitempty" json:"weight,omitempty"`
+
 	// Prefix optionally namespaces model aliases for this credential (e.g., "teamA/vertex-pro").
 	Prefix string `yaml:"prefix,omitempty" json:"prefix,omitempty"`
 

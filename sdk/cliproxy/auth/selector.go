@@ -127,6 +127,27 @@ func authPriority(auth *Auth) int {
 	return parsed
 }
 
+// authWeight returns the configured scheduling weight for an auth.
+// Returns 1 when no weight is set (uniform distribution default).
+// Values are clamped to [1, 100].
+func authWeight(auth *Auth) int {
+	if auth == nil || auth.Attributes == nil {
+		return 1
+	}
+	raw := strings.TrimSpace(auth.Attributes["weight"])
+	if raw == "" {
+		return 1
+	}
+	parsed, err := strconv.Atoi(raw)
+	if err != nil || parsed < 1 {
+		return 1
+	}
+	if parsed > 100 {
+		return 100
+	}
+	return parsed
+}
+
 func canonicalModelKey(model string) string {
 	model = strings.TrimSpace(model)
 	if model == "" {
@@ -253,7 +274,9 @@ func getAvailableAuths(auths []*Auth, provider, model string, now time.Time) ([]
 	return available, nil
 }
 
-// Pick selects the next available auth for the provider in a round-robin manner.
+// Pick selects the next available auth for the provider using weighted round-robin.
+// When all weights are 1 (default), this behaves identically to uniform round-robin.
+// Higher weights receive proportionally more traffic within the same priority tier.
 func (s *RoundRobinSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
 	_ = opts
 	now := time.Now()
@@ -262,6 +285,20 @@ func (s *RoundRobinSelector) Pick(ctx context.Context, provider, model string, o
 		return nil, err
 	}
 	available = preferCodexWebsocketAuths(ctx, provider, available)
+
+	// Compute weights for each available auth.
+	weights := make([]int, len(available))
+	totalW := 0
+	allUniform := true
+	for i, a := range available {
+		w := authWeight(a)
+		weights[i] = w
+		totalW += w
+		if w != 1 {
+			allUniform = false
+		}
+	}
+
 	key := provider + ":" + canonicalModelKey(model)
 	s.mu.Lock()
 	if s.cursors == nil {
@@ -279,7 +316,22 @@ func (s *RoundRobinSelector) Pick(ctx context.Context, provider, model string, o
 	}
 	s.cursors[key] = index + 1
 	s.mu.Unlock()
-	return available[index%len(available)], nil
+
+	// Fast path: uniform weights → classic modulo round-robin (zero overhead).
+	if allUniform || totalW == len(available) {
+		return available[index%len(available)], nil
+	}
+
+	// Weighted path: map cursor into weight space [0, totalW).
+	slot := index % totalW
+	cumulative := 0
+	for i, w := range weights {
+		cumulative += w
+		if slot < cumulative {
+			return available[i], nil
+		}
+	}
+	return available[len(available)-1], nil
 }
 
 // ensureCursorKey ensures the cursor map has capacity for the given key.
@@ -340,10 +392,13 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 						return true, blockReasonOther, next
 					}
 				}
-				return false, blockReasonNone, time.Time{}
+				// Per-model state is clean; fall through to the auth-level gate
+				// so per-account cooldown (e.g. proactive quota threshold) still
+				// blocks every model on this account.
 			}
 		}
-		return false, blockReasonNone, time.Time{}
+		// No model state (or a clean one): the auth-level cooldown below is the
+		// final authority for per-account blocking.
 	}
 	if auth.Unavailable && auth.NextRetryAfter.After(now) {
 		next := auth.NextRetryAfter

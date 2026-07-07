@@ -187,6 +187,44 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 			}
 		}
 	}
+	// Read weight from auth file.
+	if rawWeight, ok := metadata["weight"]; ok {
+		switch v := rawWeight.(type) {
+		case float64:
+			w := int(v)
+			if w >= 1 && w <= 100 {
+				a.Attributes["weight"] = strconv.Itoa(w)
+			}
+		case string:
+			weight := strings.TrimSpace(v)
+			if parsed, errAtoi := strconv.Atoi(weight); errAtoi == nil && parsed >= 1 && parsed <= 100 {
+				a.Attributes["weight"] = strconv.Itoa(parsed)
+			}
+		}
+	}
+	// Read proactive quota cooldown threshold from auth file. <=0 or absent
+	// means no limit; otherwise clamp to [1, 100].
+	if rawThreshold, ok := metadata["quota_cooldown_threshold"]; ok {
+		switch v := rawThreshold.(type) {
+		case float64:
+			t := int(v)
+			if t > 100 {
+				t = 100
+			}
+			if t >= 1 {
+				a.Attributes["quota_cooldown_threshold"] = strconv.Itoa(t)
+			}
+		case string:
+			if parsed, errAtoi := strconv.Atoi(strings.TrimSpace(v)); errAtoi == nil {
+				if parsed > 100 {
+					parsed = 100
+				}
+				if parsed >= 1 {
+					a.Attributes["quota_cooldown_threshold"] = strconv.Itoa(parsed)
+				}
+			}
+		}
+	}
 	// Read note from auth file.
 	if rawNote, ok := metadata["note"]; ok {
 		if note, isStr := rawNote.(string); isStr {

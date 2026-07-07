@@ -252,6 +252,10 @@ type Manager struct {
 	// It is initialized in NewManager; never Load() before first Store().
 	runtimeConfig atomic.Value
 
+	// autoWeight enables automatic weight adjustment based on health signals.
+	// When false, adjustWeight calls are no-ops.
+	autoWeight bool
+
 	// Optional HTTP RoundTripper provider injected by host.
 	rtProvider RoundTripperProvider
 
@@ -260,6 +264,12 @@ type Manager struct {
 	refreshLoop   *authAutoRefreshLoop
 
 	requestPrepareLocks sync.Map
+
+	// lastUIUsageFetchAt records, per auth ID, the last time the management
+	// api-call path observed a usage-endpoint response for that auth. The
+	// proactive quota probe consults it to skip a redundant upstream fetch
+	// when the UI has already pulled usage within the current probe interval.
+	lastUIUsageFetchAt map[string]time.Time
 }
 
 // NewManager constructs a manager with optional custom selector and hook.
@@ -271,14 +281,15 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 		hook = NoopHook{}
 	}
 	manager := &Manager{
-		store:            store,
-		executors:        make(map[string]ProviderExecutor),
-		selector:         selector,
-		hook:             hook,
-		auths:            make(map[string]*Auth),
-		homeRuntimeAuths: make(map[string]map[string]*Auth),
-		providerOffsets:  make(map[string]int),
-		modelPoolOffsets: make(map[string]int),
+		store:              store,
+		executors:          make(map[string]ProviderExecutor),
+		selector:           selector,
+		hook:               hook,
+		auths:              make(map[string]*Auth),
+		homeRuntimeAuths:   make(map[string]map[string]*Auth),
+		providerOffsets:    make(map[string]int),
+		modelPoolOffsets:   make(map[string]int),
+		lastUIUsageFetchAt: make(map[string]time.Time),
 	}
 	// atomic.Value requires non-nil initial value.
 	manager.runtimeConfig.Store(&internalconfig.Config{})
@@ -473,6 +484,23 @@ func (m *Manager) SetSelector(selector Selector) {
 		m.scheduler.setSelector(selector)
 		m.syncScheduler()
 	}
+}
+
+// SetAutoWeight enables or disables automatic weight adjustment based on health signals.
+func (m *Manager) SetAutoWeight(enabled bool) {
+	if m == nil {
+		return
+	}
+	m.autoWeight = enabled
+}
+
+// EffectiveWeightInfo returns the current weight state for an auth from the scheduler.
+// Returns nil if the scheduler is unavailable or the auth is not tracked.
+func (m *Manager) EffectiveWeightInfo(authID string) *WeightInfo {
+	if m == nil || m.scheduler == nil {
+		return nil
+	}
+	return m.scheduler.effectiveWeightInfo(authID)
 }
 
 // SetStore swaps the underlying persistence store.
@@ -2209,6 +2237,7 @@ func (m *Manager) Remove(ctx context.Context, id string) {
 	if m.modelPoolOffsets != nil {
 		delete(m.modelPoolOffsets, id)
 	}
+	delete(m.lastUIUsageFetchAt, id)
 	for sessionID, sessionAuths := range m.homeRuntimeAuths {
 		if sessionAuths == nil {
 			continue
@@ -3775,8 +3804,75 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		registry.GetGlobalRegistry().SuspendClientModel(result.AuthID, result.Model, suspendReason)
 	}
 
+	// Auto-adjust scheduling weight based on result health signal.
+	// Runs asynchronously to avoid contending with scheduler lock.
+	if m.autoWeight && m.scheduler != nil && result.Model != "" {
+		go m.scheduler.adjustWeight(result.AuthID, result.Model, result.Success)
+	}
+
 	m.hook.OnResult(ctx, result)
 	m.publishErrorEvent(result, authSnapshot)
+}
+
+// ApplyQuotaThresholdCooldown proactively cools down a whole account when its
+// usage-window utilization has crossed the per-account threshold. The account
+// stays unavailable until recoverAt (the upstream 5-hour window reset). It is a
+// no-op when cooldown is disabled for the auth, when recoverAt is not in the
+// future, or when the account is already cooling on or past recoverAt.
+func (m *Manager) ApplyQuotaThresholdCooldown(ctx context.Context, authID string, recoverAt time.Time) {
+	if m == nil || authID == "" {
+		return
+	}
+	now := time.Now()
+	if !recoverAt.After(now) {
+		return
+	}
+
+	var authSnapshot *Auth
+	cooldownStateChanged := false
+
+	m.mu.Lock()
+	if auth, ok := m.auths[authID]; ok && auth != nil {
+		if m.cooldownDisabledForAuth(auth) {
+			m.mu.Unlock()
+			return
+		}
+		// Skip if already cooling down at least as long as the new target.
+		if auth.Unavailable && auth.NextRetryAfter.After(now) && !recoverAt.After(auth.NextRetryAfter) {
+			m.mu.Unlock()
+			return
+		}
+
+		var cooldownRecordsBefore []CooldownStateRecord
+		trackCooldownState := m.cooldownStore != nil
+		if trackCooldownState {
+			cooldownRecordsBefore = m.cooldownStateRecordsForAuthLocked(auth, now)
+		}
+
+		auth.Unavailable = true
+		auth.Status = StatusError
+		auth.StatusMessage = "quota threshold cooldown"
+		auth.UpdatedAt = now
+		auth.Quota.Exceeded = true
+		auth.Quota.Reason = "quota_threshold"
+		auth.Quota.NextRecoverAt = recoverAt
+		auth.NextRetryAfter = recoverAt
+
+		_ = m.persist(ctx, auth)
+		authSnapshot = auth.Clone()
+		if trackCooldownState {
+			cooldownRecordsAfter := m.cooldownStateRecordsForAuthLocked(auth, now)
+			cooldownStateChanged = !cooldownStateRecordsEqual(cooldownRecordsBefore, cooldownRecordsAfter)
+		}
+	}
+	m.mu.Unlock()
+
+	if m.scheduler != nil && authSnapshot != nil {
+		m.scheduler.upsertAuth(authSnapshot)
+	}
+	if authSnapshot != nil && cooldownStateChanged {
+		m.persistCooldownStates(context.Background())
+	}
 }
 
 func ensureModelState(auth *Auth, model string) *ModelState {

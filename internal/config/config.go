@@ -347,6 +347,12 @@ type RoutingConfig struct {
 	// SessionAffinityTTL specifies how long session-to-auth bindings are retained.
 	// Default: 1h. Accepts duration strings like "30m", "1h", "2h30m".
 	SessionAffinityTTL string `yaml:"session-affinity-ttl,omitempty" json:"session-affinity-ttl,omitempty"`
+
+	// AutoWeight enables automatic weight adjustment based on health signals.
+	// When enabled, auths that trigger consecutive failures (429, 5xx) have their
+	// effective weight halved after a threshold (default 3), and recover gradually
+	// on success. Weight never drops below 1.
+	AutoWeight bool `yaml:"auto-weight,omitempty" json:"auto-weight,omitempty"`
 }
 
 // OAuthModelAlias defines a model ID alias for a specific channel.
@@ -445,6 +451,10 @@ type ClaudeKey struct {
 	// Higher values are preferred; defaults to 0.
 	Priority int `yaml:"priority,omitempty" json:"priority,omitempty"`
 
+	// Weight controls proportional request distribution within the same priority tier.
+	// Range [1, 100]; 0 means unset (treated as 1 for uniform distribution).
+	Weight int `yaml:"weight,omitempty" json:"weight,omitempty"`
+
 	// Prefix optionally namespaces models for this credential (e.g., "teamA/claude-sonnet-4").
 	Prefix string `yaml:"prefix,omitempty" json:"prefix,omitempty"`
 
@@ -508,6 +518,10 @@ type CodexKey struct {
 	// Higher values are preferred; defaults to 0.
 	Priority int `yaml:"priority,omitempty" json:"priority,omitempty"`
 
+	// Weight controls proportional request distribution within the same priority tier.
+	// Range [1, 100]; 0 means unset (treated as 1 for uniform distribution).
+	Weight int `yaml:"weight,omitempty" json:"weight,omitempty"`
+
 	// Prefix optionally namespaces models for this credential (e.g., "teamA/gpt-5-codex").
 	Prefix string `yaml:"prefix,omitempty" json:"prefix,omitempty"`
 
@@ -563,6 +577,10 @@ type GeminiKey struct {
 	// Higher values are preferred; defaults to 0.
 	Priority int `yaml:"priority,omitempty" json:"priority,omitempty"`
 
+	// Weight controls proportional request distribution within the same priority tier.
+	// Range [1, 100]; 0 means unset (treated as 1 for uniform distribution).
+	Weight int `yaml:"weight,omitempty" json:"weight,omitempty"`
+
 	// Prefix optionally namespaces models for this credential (e.g., "teamA/gemini-3-pro-preview").
 	Prefix string `yaml:"prefix,omitempty" json:"prefix,omitempty"`
 
@@ -613,6 +631,10 @@ type OpenAICompatibility struct {
 	// Priority controls selection preference when multiple providers or credentials match.
 	// Higher values are preferred; defaults to 0.
 	Priority int `yaml:"priority,omitempty" json:"priority,omitempty"`
+
+	// Weight controls proportional request distribution within the same priority tier.
+	// Range [1, 100]; 0 means unset (treated as 1 for uniform distribution).
+	Weight int `yaml:"weight,omitempty" json:"weight,omitempty"`
 
 	// Disabled prevents this provider from being used for routing.
 	Disabled bool `yaml:"disabled,omitempty" json:"disabled,omitempty"`

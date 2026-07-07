@@ -1318,6 +1318,7 @@ func (s *Service) applyConfigUpdateWithAuthSynthesis(newCfg *config.Config, synt
 		}
 
 		s.coreManager.SetSelector(selector)
+		s.coreManager.SetAutoWeight(newCfg.Routing.AutoWeight)
 	}
 
 	s.applyRetryConfig(newCfg)

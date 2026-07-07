@@ -195,6 +195,15 @@ func (h *Handler) APICall(c *gin.Context) {
 		return
 	}
 
+	// When the proxied request targets a known upstream usage endpoint, parse
+	// the body we already have and apply the per-account quota threshold
+	// cooldown immediately, so the UI's manual refresh triggers cooldown
+	// without waiting for the next proactive probe tick. No-op for any other
+	// URL or when the account has no threshold configured.
+	if auth != nil && resp.StatusCode == http.StatusOK && len(respBody) > 0 {
+		h.authManager.ApplyQuotaCooldownFromUsageResponse(c.Request.Context(), auth.ID, urlStr, respBody)
+	}
+
 	c.JSON(http.StatusOK, apiCallResponse{
 		StatusCode: resp.StatusCode,
 		Header:     resp.Header,

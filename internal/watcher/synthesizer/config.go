@@ -81,6 +81,9 @@ func (s *ConfigSynthesizer) synthesizeGeminiKeyEntries(ctx *SynthesisContext, en
 		if entry.Priority != 0 {
 			attrs["priority"] = strconv.Itoa(entry.Priority)
 		}
+		if entry.Weight >= 1 && entry.Weight <= 100 {
+			attrs["weight"] = strconv.Itoa(entry.Weight)
+		}
 		if base != "" {
 			attrs["base_url"] = base
 		}
@@ -135,6 +138,9 @@ func (s *ConfigSynthesizer) synthesizeClaudeKeys(ctx *SynthesisContext) []*corea
 		}
 		if ck.Priority != 0 {
 			attrs["priority"] = strconv.Itoa(ck.Priority)
+		}
+		if ck.Weight >= 1 && ck.Weight <= 100 {
+			attrs["weight"] = strconv.Itoa(ck.Weight)
 		}
 		if base != "" {
 			attrs["base_url"] = base
@@ -193,6 +199,9 @@ func (s *ConfigSynthesizer) synthesizeCodexKeys(ctx *SynthesisContext) []*coreau
 		}
 		if ck.Priority != 0 {
 			attrs["priority"] = strconv.Itoa(ck.Priority)
+		}
+		if ck.Weight >= 1 && ck.Weight <= 100 {
+			attrs["weight"] = strconv.Itoa(ck.Weight)
 		}
 		if ck.BaseURL != "" {
 			attrs["base_url"] = ck.BaseURL
@@ -268,6 +277,9 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 			if compat.Priority != 0 {
 				attrs["priority"] = strconv.Itoa(compat.Priority)
 			}
+			if compat.Weight >= 1 && compat.Weight <= 100 {
+				attrs["weight"] = strconv.Itoa(compat.Weight)
+			}
 			if key != "" {
 				attrs["api_key"] = key
 			}
@@ -309,6 +321,9 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 			}
 			if compat.Priority != 0 {
 				attrs["priority"] = strconv.Itoa(compat.Priority)
+			}
+			if compat.Weight >= 1 && compat.Weight <= 100 {
+				attrs["weight"] = strconv.Itoa(compat.Weight)
 			}
 			if hash := diff.ComputeOpenAICompatModelsHash(compat.Models); hash != "" {
 				attrs["models_hash"] = hash
@@ -358,6 +373,9 @@ func (s *ConfigSynthesizer) synthesizeVertexCompat(ctx *SynthesisContext) []*cor
 		}
 		if compat.Priority != 0 {
 			attrs["priority"] = strconv.Itoa(compat.Priority)
+		}
+		if compat.Weight >= 1 && compat.Weight <= 100 {
+			attrs["weight"] = strconv.Itoa(compat.Weight)
 		}
 		if key != "" {
 			attrs["api_key"] = key
