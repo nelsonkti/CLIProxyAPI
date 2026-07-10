@@ -518,6 +518,11 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
 						}
 					}
 				}
+				if pv := gjson.GetBytes(data, "proxy_url"); pv.Exists() && pv.Type == gjson.String {
+					if trimmed := strings.TrimSpace(pv.String()); trimmed != "" {
+						fileData["proxy_url"] = trimmed
+					}
+				}
 			}
 
 			files = append(files, fileData)
@@ -679,6 +684,9 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 	}
 	if websockets, ok := authWebsocketsValue(auth); ok {
 		entry["websockets"] = websockets
+	}
+	if proxyURL := strings.TrimSpace(auth.ProxyURL); proxyURL != "" {
+		entry["proxy_url"] = proxyURL
 	}
 	// Expose imported_at and derived survival_days (whole days since first import).
 	if auth.Metadata != nil {
